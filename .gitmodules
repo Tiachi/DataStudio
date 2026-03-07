@@ -1,6 +1,8 @@
 [submodule "tools/LLMRouter"]
 	path = tools/LLMRouter
 	url = https://github.com/Open-Bee/LLMRouter.git
+	branch = main
 [submodule "tools/DataVis"]
 	path = tools/DataVis
 	url = https://github.com/Open-Bee/DataVis.git
+	branch = main
