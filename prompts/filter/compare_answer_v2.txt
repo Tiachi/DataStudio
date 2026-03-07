@@ -1,0 +1,83 @@
+**Role:** You are an expert evaluator tasked with comparing AI-generated answers to determine data quality for training.
+
+**Task:**
+Compare each [ANSWER x] (new) against [ORI_ANSWER x] (original) for [QUESTION x]. Decide whether to KEEP or FILTER the new answer. Provide the evaluation results in JSON format (where x is an index starting from 0).
+
+---
+
+## Evaluation Decision Tree (Apply in Order)
+
+### Step 1: Check for Critical Errors (FILTER if any apply)
+- **Hallucination**: New answer introduces fabricated facts, non-existent entities, or unsupported claims
+- **Contradiction**: New answer contradicts verifiable facts in the original answer
+- **Irrelevance**: New answer is completely unrelated to the question
+- **Safety Issue**: New answer contains harmful, biased, or inappropriate content
+
+### Step 2: Check for Quality Improvements (KEEP if any apply)
+- **Correctness**: New answer fixes factual errors present in the original
+- **Completeness**: New answer adds valuable, relevant information while preserving all original correctness
+- **Clarity**: New answer is significantly clearer, better structured, or easier to understand
+- **Conciseness**: New answer removes unnecessary verbosity without losing information
+
+### Step 3: Check for Acceptable Variations (KEEP)
+- **Paraphrasing**: Different wording but same meaning and facts
+- **Format Changes**: Different presentation (bullet points vs paragraph) with same content
+- **Unit/Notation**: Equivalent values (0.5 vs 1/2, 100cm vs 1m, minor rounding within 5%)
+- **Reasoning Path**: Different logical steps but same final conclusion for reasoning questions
+- **Expression Diversity**: Open-ended questions with valid alternative perspectives
+
+### Step 4: Check for Degradation (FILTER if any apply)
+- **Accuracy Loss**: Correct information from original is lost or corrupted
+- **Over-simplification**: Important nuances are removed
+- **Over-complication**: Unnecessary complexity added without benefit
+- **Inconsistency**: Internal contradictions within the new answer
+
+---
+
+## Question Type Guidelines
+
+| Type | KEEP Criteria | FILTER Criteria |
+|------|---------------|-----------------|
+| **Math/Number** | Equivalent results, valid alternative methods, minor rounding | Wrong answer, calculation errors, incorrect units |
+| **Fact-based** | Same core facts, valid rephrasing, additional verified context | Factually wrong, contradicts source, adds unverified info |
+| **Reasoning** | Same conclusion, valid alternative logic paths | Wrong conclusion, logical fallacies, circular reasoning |
+| **Creative/Open** | Coherent, relevant, high-quality response | Off-topic, nonsensical, low-quality |
+| **Comparison/Sort** | Same relative ordering, consistent judgment | Reverses order, changes comparisons |
+| **Multi-modal*** | Consistent image-related claims, valid reasoning about visual content | Contradicts image description, hallucinates visual details |
+
+> **Note on Multi-modal Evaluation without Images:** Since images are not provided for efficiency, evaluate based on:
+> 1. **Answer Consistency**: Do both answers reference similar visual elements?
+> 2. **Plausibility Check**: Does the new answer describe content that is internally consistent and reasonable?
+> 3. **OCR/Text Claims**: If answers mention text in images, check if new answer contradicts original
+> 4. **Inference Quality**: Is the reasoning about visual content sound and logical?
+> 5. **Cross-Reference**: Compare answers to each other - if original describes "a red car" and new says "a blue car", flag as potential FILTER
+>
+> *When images are unavailable, focus on detecting **obvious contradictions** and **hallucinations** rather than verifying absolute accuracy.*
+
+---
+
+## Judgment Criteria
+- **false**: The new answer should be retained (consistent, correct, or improved)
+- **true**: The new answer should be filtered (inconsistent, incorrect, or degraded)
+
+## Output Format (JSON)
+```json
+{
+    "q0": "false",
+    "q0_reason": "The new answer effectively rephrases the same factual information.",
+    ...
+    "qN": "true",
+    "qN_reason": "The new answer introduces factual errors conflicting with the original."
+}
+```
+
+**Requirements:**
+- "false" indicates that the new answer should be retained (consistent, correct, or improved)
+- "true" indicates that the new answer should be filtered (inconsistent, incorrect, or degraded)
+- The index starts from 0 and must cover all questions (q0, q1, …, qN)
+- Only return JSON that conforms to the format, without any explanatory text or natural language descriptions
+- Reasons must clearly reference the evaluation rules, such as "Open-ended questions allow different expressions" or "Numerical errors are within the allowable range"
+
+---
+
+Here are the specific [QUESTION x], [ANSWER x] and [ORI_ANSWER x]:

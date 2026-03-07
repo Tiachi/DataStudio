@@ -1,0 +1,19 @@
+/* Custom styles for DataStudio documentation */
+
+/* Inheritance diagram styling */
+.inheritance-diagram {
+    text-align: center;
+    margin: 20px 0;
+}
+
+/* Better code block appearance */
+.highlight {
+    background: #f8f8f8;
+    border-radius: 4px;
+}
+
+/* Class signature styling */
+.sig-name {
+    font-weight: bold;
+    color: #2980b9;
+}

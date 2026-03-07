@@ -1,0 +1,42 @@
+**Task:**  
+Evaluate whether the new answer [ANSWER x] should be retained or filtered compared to the original answer [ORI_ANSWER x] for [QUESTION x] according to the following guidelines. Provide the evaluation results in JSON format (where x is an index starting from 0).  
+
+**Evaluation Guidelines:**  
+1. **Open-Ended/Descriptive Questions**  
+   - **Rule:** Answers are inherently diverse and subjective. Retain the new answer unless it is clearly irrelevant to the question.  
+2. **Precise Answer Questions**  
+   - **Rule:** Retain the new answer if it is numerically equivalent to the original answer (e.g., different formats, minor rounding errors within 0.1, valid unit conversions). Filter it if there is a fundamental conflict in numerical values.  
+3. **Factual Questions**  
+   - **Rule:** Retain the new answer if it conveys the same fact (rephrasing is allowed). Filter it if it introduces fabricated or irrelevant content.  
+4. **Conceptual or Common Sense Questions**  
+   - **Rule:** Retain the new answer if the final conclusion or reasoning result is consistent, regardless of wording. Filter it if there is a logical contradiction or opposite judgment.  
+5. **Chart Analysis Questions**  
+   - **Rule:** Retain the new answer if both reference consistent content in the chart. Filter it if it conflicts with the factual data in the chart.  
+6. **Logical Reasoning or Hypothetical Questions**  
+   - **Rule:** Retain the new answer if the final conclusion is consistent, even if the steps differ. Filter it if the results are contradictory or contain logical errors.  
+7. **Sorting/Priority/Comparison Questions**  
+   - **Rule:** Retain the new answer if the relative order or judgment is consistent. Filter it if the new answer reverses or distorts the sorting/comparison result.  
+
+
+**Judgment Criteria:**  
+- **false:** The new answer meets consistency requirements, supplements information, and should be retained.  
+- **true:** The new answer is inconsistent, irrelevant, or contains factual errors, and should be filtered.  
+
+**Output Format (JSON):**  
+```json
+{
+    "q0": "false",
+    "q0_reason": "The new answer effectively rephrases the same factual information.",
+    ...
+    "qN": "true",
+    "qN_reason": "The new answer introduces numerical values conflicting with the original precise answer."
+}
+```  
+
+**Explanation:**  
+- "false" indicates that the new answer should be retained (consistent), and "true" indicates that the new answer should be filtered (inconsistent or erroneous).  
+- The index starts from 0 and must cover all questions (q0, q1, …, qN).  
+- Only return JSON that conforms to the format, without any explanatory text or natural language descriptions.
+- Reasons must clearly reference the evaluation rules, such as "Open-ended questions allow different expressions" or "Numerical errors are within the allowable range."
+
+Here are the specific [QUESTION x], [ANSWER x] and [ORI_ANSWER x]:

@@ -1,0 +1,29 @@
+Given the image and the [QUESTION x], your task is to determine:  
+1. Whether the image and question are relevant to each other;  
+2. Whether they form an appropriate question;
+3. Whether there are any obvious issues with the question.
+
+Below are some examples of evaluation scenarios:  
+1. **Relevance Check**: Is the image related to the question?  
+   - Example 1: If the question is about "the dog in the photo," the image should clearly depict a dog or something directly related to dogs.  
+   - Example 2: If the question asks about the diameter of a circle in the image, but the image does not contain a circle → filter out.  
+   - Example 3: If the image is completely unrelated to the question → filter out.  
+2. **Ambiguous or Vague Question**: If the question is too vague, unclear, or lacks sufficient context to establish a clear connection with the image → filter out.  
+   - Example 1: "What do you think about this?" without specifying what "this" refers to in the image's context.  
+   - Example 2: Ambiguous question (e.g., unclear referents) → filter out.  
+   - Example 3: The question is not a question. (e.g., a list of numbers, a table, etc.) → filter out.
+3. **Language Filter**: If the question contains languages other than Chinese or English → filter out.
+
+After evaluating the image and question, provide a clear decision:  
+- false: If the image and question are relevant, the relationship is clear, and no issues are found.  
+- true: If the image and question do not match, contain issues (e.g., ambiguity, contradiction, irrelevance, language errors), or fail any evaluation criteria.  
+
+**Output Format(json format)**:
+{
+    "q0": "true",
+    "q0_reason": "Briefly explain the reason for filtering",
+    ...
+}
+
+where the returned result index starts from 0. If there are N questions, return the results of all questions(q0, q1, ..., qN). 
+Here are the specific [QUESTION x] and image:

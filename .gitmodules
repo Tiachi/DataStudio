@@ -1,0 +1,6 @@
+[submodule "tools/LLMRouter"]
+	path = tools/LLMRouter
+	url = https://github.com/uyzhang/LLMRouter.git
+[submodule "tools/DataVis"]
+	path = tools/DataVis
+	url = https://github.com/uyzhang/DataVis.git
