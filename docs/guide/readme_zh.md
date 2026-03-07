@@ -37,8 +37,8 @@
 
 ### 辅助工具
 
-- **[LLMRouter](../../tools/LLMRouter/)**：基于 Go 开发的高性能反向代理路由器，兼容 OpenAI API，支持多个 LLM 后端的加权负载均衡、滑动窗口 RPM 限流、异步健康检查与自动故障转移、配置热加载等。详见其 [README](../../tools/LLMRouter/README.md)。
-- **[DataVis](../../tools/DataVis/)**：多模态数据可视化与分析平台（React + FastAPI），支持分页浏览、多维度过滤和统计分析。
+- **[LLMRouter](https://github.com/Open-Bee/LLMRouter/)**：基于 Go 开发的高性能反向代理路由器，兼容 OpenAI API，支持多个 LLM 后端的加权负载均衡、滑动窗口 RPM 限流、异步健康检查与自动故障转移、配置热加载等。详见其 [README](../../tools/LLMRouter/README.md)。
+- **[DataVis](https://github.com/Open-Bee/DataVis/)**：多模态数据可视化与分析平台（React + FastAPI），支持分页浏览、多维度过滤和统计分析。
 
 ---
 
