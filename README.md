@@ -37,8 +37,8 @@
 
 ### Auxiliary Tools
 
-- **[LLMRouter](tools/LLMRouter/)**: A high-performance reverse proxy router built in Go, OpenAI API-compatible, supporting multiple LLM backends with weighted load balancing, sliding-window RPM throttling, async health checks with auto failover, and config hot-reload. See its [README](tools/LLMRouter/README.md) for details.
-- **[DataVis](tools/DataVis/)**: A multimodal data visualization and analysis platform (React + FastAPI) for browsing, filtering, and analyzing processed datasets.
+- **[LLMRouter](https://github.com/Open-Bee/LLMRouter/)**: A high-performance reverse proxy router built in Go, OpenAI API-compatible, supporting multiple LLM backends with weighted load balancing, sliding-window RPM throttling, async health checks with auto failover, and config hot-reload. See its [README](tools/LLMRouter/README.md) for details.
+- **[DataVis](https://github.com/Open-Bee/DataVis/)**: A multimodal data visualization and analysis platform (React + FastAPI) for browsing, filtering, and analyzing processed datasets.
 
 ---
 
