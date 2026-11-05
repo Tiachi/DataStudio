@@ -108,6 +108,14 @@ For a complete tutorial covering data formats, MLLM operators, custom operators,
 
 ---
 
+## Image CoT SFT Construction
+
+The opt-in `run_image_cot.py` entry point adds audited short/long image-CoT
+generation, strict verification, crash recovery, and gated exports. It supports
+self-hosted OpenAI-compatible teachers and a DeepSeek API pilot profile, without
+changing the default runner. See the [implementation and usage guide](docs/image_cot_implementation.md)
+for configuration, local tests, and the separate runtime quality/training gates.
+
 ## Project Structure
 
 ```
