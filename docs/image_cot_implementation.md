@@ -1,5 +1,8 @@
 # DataStudio 图片 CoT：实现、使用与验收边界
 
+实际操作请先读 **[详细操作手册](image_cot_operations_manual.md)**；
+本页保留架构、实现取舍及验收边界，[项目首页](../README.md)提供入口导航。
+
 日期：2026-11-05。上游基线：`676bcb8d5494d65c8fb85185ac26d98da6c92842`。
 分支：`codex/image-cot-v1`。可选入口为[run_image_cot.py](../run_image_cot.py)；
 原run.py、默认算子、LMDB与多进程引擎保留。没有调用付费API，没有训练。
