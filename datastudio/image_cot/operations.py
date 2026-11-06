@@ -25,6 +25,7 @@ from .contracts import (
     require,
     strict_json,
 )
+from .tool_guard import contains_tool
 
 
 def completed_message(receipt):
@@ -39,6 +40,9 @@ def completed_message(receipt):
     )
     require(choices[0].get("finish_reason") == "stop", "incomplete_or_unknown_finish")
     message = choices[0].get("message")
+    require(
+        not contains_tool(receipt.raw, strict_fields=False), "tool_protocol_excluded"
+    )
     require(
         type(message) is dict
         and not message.get("tool_calls")
@@ -199,7 +203,9 @@ def parse_text_judgment(receipt, policy):
             ],
         }
         result = parse_judgment(
-            replace(receipt, raw=raw), {**policy, "visual_evidence_required": False}
+            replace(receipt, raw=raw),
+            {**policy, "visual_evidence_required": False},
+            text_only=True,
         )
         if "judgment" in result:
             result["judgment"].pop("visual_status")
@@ -335,7 +341,7 @@ def validate_bypass(source):
         return {"status": "uncertain", "reason": "box_annotation_requires_review"}
 
 
-def parse_judgment(receipt, policy):
+def parse_judgment(receipt, policy, *, text_only=False):
     try:
         value = strict_json(completed_message(receipt)["content"])
         require(
@@ -400,11 +406,18 @@ def parse_judgment(receipt, policy):
             or any(c["finding"] == "uncertain" for c in value["checks"])
         ):
             status = "uncertain"
-        elif policy.get("visual_evidence_required", True) and not any(
-            c["kind"] == "visual"
-            and c["evidence_source"] == "image:0"
-            and c["finding"] == "supported"
-            for c in value["checks"]
+        elif (
+            not text_only
+            and (
+                policy.get("evidence_contract") == "v2"
+                or policy.get("visual_evidence_required", True)
+            )
+            and not any(
+                c["kind"] == "visual"
+                and c["evidence_source"] == "image:0"
+                and c["finding"] == "supported"
+                for c in value["checks"]
+            )
         ):
             status = "uncertain"
         elif policy.get("evidence_contract") == "v2" and not all(
@@ -509,7 +522,11 @@ def execute_audited_batch(operator, items, context):
     for item in items:
         require(
             item.qa_count == 1
-            and (item.image is not None or context.operation == "text_verify"),
+            and (
+                item.image is not None
+                or context.operation
+                in {"text_verify", "answer_verify", "reasoning_verify"}
+            ),
             "single_decoded_image_qa_required",
             InvariantError,
         )
@@ -537,6 +554,25 @@ def execute_audited_batch(operator, items, context):
         result = Result(item_idx=item.idx)
         if receipt.error == "budget_not_dispatched":
             outcome = {"status": "not_dispatched", "reason": "budget_not_dispatched"}
+        elif receipt.raw and contains_tool(receipt.raw, strict_fields=False):
+            outcome = {
+                "status": "fail",
+                "reason": "tool_protocol_excluded",
+                "failure_kind": "tool",
+            }
+        elif (
+            context.settings.get("_schema_version") == "image_cot.config/3"
+            and operator.is_verifier
+        ):
+            from .split_audit import parse_rating_v3, parse_text_audit
+
+            outcome = (
+                parse_question_check(receipt)
+                if context.operation == "question_check"
+                else parse_rating_v3(receipt, context.settings["tiers"])
+                if context.operation == "effort_rating"
+                else parse_text_audit(receipt, context.operation)
+            )
         elif operator.is_verifier:
             outcome = (
                 parse_question_check(receipt)
@@ -552,7 +588,12 @@ def execute_audited_batch(operator, items, context):
                 text = render_candidate(receipt, context.operation)
                 outcome = check_candidate(text, source.policy)
                 if outcome["status"] == "pass":
-                    outcome = verify_final(text, source)
+                    if context.settings.get("_schema_version") == "image_cot.config/3":
+                        outcome["local_answer_check"] = verify_final(text, source)
+                    else:
+                        outcome = verify_final(text, source)
+                if outcome["status"] == "fail":
+                    outcome["failure_kind"] = "candidate"
                 outcome.update(
                     text_hash=identity(text), renderer="honey_compact_native/1"
                 )
@@ -598,7 +639,12 @@ def make_model_task(context, question_id, payload, answer=None):
 
 def task_input_digest(source, candidate, answer, operation):
     inputs = [source.question_id, source.media_sha256, candidate, answer]
-    if operation in {"joint_verify", "text_verify"}:
+    if operation in {
+        "joint_verify",
+        "text_verify",
+        "answer_verify",
+        "reasoning_verify",
+    }:
         inputs.append(
             {
                 "source_reference": source.reference,
@@ -640,9 +686,7 @@ class _ContextMixin:
 
     def bind_context(self, context):
         self.context = context
-        if isinstance(
-            self.request_builder, (VerificationRequestBuilder, RatingRequestBuilder)
-        ):
+        if hasattr(self.request_builder, "bind_context"):
             self.request_builder.bind_context(context)
 
     def process_batch(self, items):

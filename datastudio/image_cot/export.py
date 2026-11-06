@@ -121,6 +121,11 @@ def verified_selection(run_root):
 
 
 def selected_text(selection, source, store):
+    from .tool_guard import contains_tool
+
+    require(not contains_tool(source.original), "source_tool_dependency")
+    if selection.get("schema_version") == "image_cot.selection/3":
+        return selected_text_v3(selection, source, store)
     if selection.get("schema_version") == "image_cot.selection/2":
         return selected_text_v2(selection, source, store)
     generation, receipt, _plan = verified_ref(store, selection["receipt_ref"])
@@ -249,6 +254,78 @@ def selected_text_v2(selection, source, store):
             == task_input_digest(source, selection["candidate_id"], text, role)
             and parser(raw, source.policy)["status"] == "pass",
             "v2_judgment_revalidation",
+        )
+    return text
+
+
+def selected_text_v3(selection, source, store):
+    from .split_audit import parse_rating_v3, parse_text_audit
+    from .operations import parse_question_check, check_candidate
+    from .policy import EFFORTS, cap_for
+
+    config = read_json(store.root / "run.json")["config"]
+    policy = config["policy"]
+    require(
+        policy["review_mode"] == "split_text"
+        and selection["review_mode"] == "split_text"
+        and selection["visual_audit"] == "not_checked",
+        "v3_audit_mode",
+    )
+    if source.policy["qa_check_enabled"]:
+        result, raw, plan = verified_ref(store, selection["question_check_ref"])
+        require(
+            result["question_id"] == source.question_id
+            and plan["stage"] == "question_check"
+            and parse_question_check(raw)["status"] == "pass",
+            "v3_question_revalidation",
+        )
+    result, raw, plan = verified_ref(store, selection["rating_ref"])
+    rating = parse_rating_v3(raw, policy["tiers"])
+    require(
+        result["question_id"] == source.question_id
+        and plan["stage"] == "effort_rating"
+        and rating["status"] == "pass"
+        and rating["effort_cap"] != "none",
+        "v3_rating_revalidation",
+    )
+    cap = cap_for(source, policy, rating["effort_cap"])
+    require(
+        selection["effort_cap"] == cap
+        and selection["effort"] in policy["tiers"]
+        and EFFORTS.index(selection["effort"]) <= EFFORTS.index(cap)
+        and selection["stage"] == f"generate_{selection['effort']}",
+        "export_effort_cap_violation",
+    )
+    generation, receipt, plan = verified_ref(store, selection["receipt_ref"])
+    text = render_candidate(receipt, selection["stage"])
+    require(
+        generation["status"] == "pass"
+        and plan["stage"] == selection["stage"]
+        and generation["question_id"] == source.question_id
+        and generation["candidate_id"] == selection["candidate_id"]
+        and generation["recipe_signature"] == selection["recipe_signature"]
+        and identity(text) == generation["text_hash"] == selection["text_hash"]
+        and check_candidate(text, source.policy)["status"] == "pass",
+        "v3_generation_revalidation",
+    )
+    require(
+        [a["role"] for a in selection["audit_refs"]]
+        == ["answer_verify", "reasoning_verify"],
+        "both_text_audits_required",
+    )
+    for audit in selection["audit_refs"]:
+        judgment, raw, plan = verified_ref(store, audit["receipt_ref"])
+        task = next(t for t in plan["tasks"] if t["task_id"] == judgment["task_id"])
+        require(
+            judgment["status"] == "pass"
+            and judgment["question_id"] == source.question_id
+            and judgment["candidate_id"] == selection["candidate_id"]
+            and judgment["recipe_signature"] == audit["recipe_signature"]
+            and task["operation"] == audit["role"]
+            and task["input_digest"]
+            == task_input_digest(source, selection["candidate_id"], text, audit["role"])
+            and parse_text_audit(raw, audit["role"])["status"] == "pass",
+            "v3_text_audit_revalidation",
         )
     return text
 
@@ -481,8 +558,9 @@ def export_training(run_root, *, preview=True, export_policy=None):
             "PROCESSING": (
                 "统一重新生成；评级为硬上限；从low起首个合格即停；审核模式="
                 + spec["config"]["policy"]["review_mode"]
-                + "。text_only未逐条核验视觉事实；原始媒体未修改。原始字段映射："
-                if spec["config"]["schema_version"] == "image_cot.config/2"
+                + "。文本审核模式未逐条核验图中事实；原始媒体未修改。原始字段映射："
+                if spec["config"]["schema_version"]
+                in {"image_cot.config/2", "image_cot.config/3"}
                 else "短链生成、严格终答/视觉/过程审核、选择性长链；原始媒体未修改。原始字段映射："
             )
             + canonical(policy.get("original_field_mapping", {})).decode(),

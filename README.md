@@ -6,15 +6,17 @@
 
 **当前分支：`codex/image-cot-v1`。** 已完成本地实现验证；真实教师效果、生产吞吐与学生训练收益待验证。
 
-**新任务使用 v2 评级封顶产线：** QA/Honey 全部重新生成，可跳过图题检查；评级作为上限，
-从 low 起按 low→high→max 递进，首条合格即停。评级 high 时 high 失败即拒绝，绝不调用 max。
-Kimi 使用其原生 reasoning/content，生成默认只传图片与问题；文本审核显式标记未做视觉核验。
-先读 **[v2 完整操作手册与改造说明](docs/image_cot_v2_operations.md)**，配置入口为
-[kimi_cascade.py](configs/image_cot/kimi_cascade.py)。后文的双档图与 base/pilot 示例为兼容的 v1 路线。
+**新任务使用 v3：** 工具数据排除；评级为 `none / low / high / max`，题目与参考质量先于难度。
+none 直接退出 CoT 构建；其余从 low 起生成，首条合格即停，绝不突破评级上限。
+答案验证与 CoT 审核分别调用纯文本推理模型，两份 prompt 不含视觉审核要求；阶段回执、理由和统计独立保存。
+先读 **[v3 完整操作手册](docs/image_cot_v3_operations.md)**，配置入口为
+[kimi_split_text.py](configs/image_cot/kimi_split_text.py)。v1/v2 保留为历史兼容路径。
 
 | 阅读目标 | 文档 |
 |---|---|
-| 使用新产线：格式盘点、Honey 重生成、评级硬上限、三种审核 | **[v2 操作手册](docs/image_cot_v2_operations.md)** |
+| 使用新产线：四档评级、质量检查、两步文本审核、阶段保存与统计 | **[v3 操作手册](docs/image_cot_v3_operations.md)** |
+| 查看 v3 验证范围 | [v3 验证记录](docs/image_cot_v3_validation_2026-11-06.md) |
+| 历史三档与审核模式 | [v2 操作手册](docs/image_cot_v2_operations.md) |
 | 安装与旧版双档示例 | [v1 操作手册](docs/image_cot_operations_manual.md) |
 | 理解模块、实现取舍和边界 | [实现说明](docs/image_cot_implementation.md) |
 | 查看测试范围和证据 | [523 项本地验证记录](docs/image_cot_validation_2026-11-05.md) |
@@ -23,8 +25,8 @@ Kimi 使用其原生 reasoning/content，生成默认只传图片与问题；文
 
 ## 1. 这个项目解决什么问题
 
-输入已经存在的图片、问题和参考答案。教师生成时不读取参考答案；生成后检查终答、视觉依据、
-关键推理与指令完整性，再决定接受、拒绝、人工复核或升级长链。训练输出保留审核通过的正文。
+输入已经存在的图片、问题和参考答案。先排除工具数据并评级；教师生成时不读取参考答案；
+生成后分别检查终答与推理，再决定接受、拒绝、待复核或在封顶范围内升档。训练输出保留审核通过的正文。
 
 v2 面向非数学解题、非代码任务的图片推理，包括简单视觉计数和有可靠参考的开放题。纯 OCR 和框坐标
 不进入 v2 CoT 生成；旧版仍有原标注旁路。每题默认只选一条合格链，控制重复曝光。

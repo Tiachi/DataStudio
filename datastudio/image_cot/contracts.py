@@ -220,10 +220,12 @@ def load_config(path):
 def validate_config(config, *, runtime=False, backend="http"):
     """Pure validation/resolution; missing real budgets fail before any dispatch."""
     config = strict_json(canonical(config))
-    from .policy import V2_SCHEMA, validate_policy
+    from .policy import V2_SCHEMA, V3_SCHEMA, validate_policy
 
-    version_two = config.get("schema_version") == V2_SCHEMA
-    require(config.get("schema_version") in {SCHEMA, V2_SCHEMA}, "config_schema")
+    version_two = config.get("schema_version") in {V2_SCHEMA, V3_SCHEMA}
+    require(
+        config.get("schema_version") in {SCHEMA, V2_SCHEMA, V3_SCHEMA}, "config_schema"
+    )
     expected_roles = validate_policy(config) if version_two else set(ROLES)
     require(config.get("mode") in {"pilot", "production", "mock"}, "invalid_mode")
     require(backend in {"http", "mock"}, "invalid_backend")
@@ -370,6 +372,11 @@ def validate_config(config, *, runtime=False, backend="http"):
             require(type(pool) is dict, f"quota_pool_required:{role}")
             for name in ("rpm", "input_tpm", "output_tpm", "input_tokens_per_request"):
                 positive_int(pool.get(name), f"quota.{name}")
+            require(
+                pool["input_tokens_per_request"] <= pool["input_tpm"]
+                and model["max_output_tokens"] <= pool["output_tpm"],
+                f"single_request_exceeds_quota:{role}",
+            )
         # Sharing a credential/endpoint cannot multiply its effective quota.
         owners = {}
         for role, model in models.items():

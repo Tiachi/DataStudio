@@ -51,7 +51,9 @@ def process_part(
 
     def stop(state, outcome, *, input_check=False):
         status = outcome["status"]
-        if any(
+        if outcome.get("failure_kind") == "tool":
+            state.update(terminal="input_rejected", reason="tool_protocol_excluded")
+        elif any(
             e.startswith("scope_excluded")
             for e in outcome.get("judgment", {}).get("critical_errors", [])
         ):

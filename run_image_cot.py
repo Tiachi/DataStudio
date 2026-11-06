@@ -39,6 +39,9 @@ def main(argv=None):
             group.add_argument("--preview", action="store_true")
             group.add_argument("--stage-release", action="store_true")
             group.add_argument("--publish", action="store_true")
+    calibration = sub.add_parser("rating-report")
+    calibration.add_argument("--run", required=True)
+    calibration.add_argument("--labels", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "check":
@@ -64,6 +67,10 @@ def main(argv=None):
         elif args.command == "report":
             print(canonical(read_json(Path(args.run) / "report.json")).decode("utf-8"))
             return 0
+        elif args.command == "rating-report":
+            from datastudio.image_cot.rating_calibration import rating_calibration
+
+            result = rating_calibration(args.run, args.labels)
         else:
             policy = load_config(args.config)["export"] if args.config else None
             result = (

@@ -3,7 +3,8 @@
 from dataclasses import replace
 
 from .contracts import ConfigurationError, identity, require, validate_input
-from .policy import source_policy
+from .policy import source_policy, is_v3
+from .tool_guard import contains_tool
 
 
 def validate_source_chain(value):
@@ -27,11 +28,13 @@ def adapt_records(original, spec, checksum, row, config):
         require(type(dialogs) is list and bool(dialogs), "honey_data_list_required")
     else:
         dialogs = [original]
+    source_has_tools = contains_tool(original)
     for index, dialog in enumerate(dialogs):
         error = None
         reference_missing = False
         try:
             require(type(dialog) is dict, "honey_dialog_object_required")
+            require(not source_has_tools, "source_tool_dependency")
             require(
                 not dialog.get("tools") and not original.get("tools"),
                 "source_tool_dependency",
@@ -75,6 +78,15 @@ def adapt_records(original, spec, checksum, row, config):
                     "images": original.get("images"),
                     "category": dialog.get("category", original.get("category")),
                 }
+                category_field = spec.get("category_field", "category")
+                if "category_field" in spec:
+                    require(
+                        category_field in dialog or category_field in original,
+                        "source_category_field_missing",
+                    )
+                projected[category_field] = dialog.get(
+                    category_field, original.get(category_field)
+                )
                 # HF Image objects/bytes must be exported to explicit media paths first.
                 require(
                     type(projected["images"]) is list
@@ -89,6 +101,11 @@ def adapt_records(original, spec, checksum, row, config):
                     and len(conversations) == 2
                     and type(conversations[1]) is dict
                 ):
+                    require(
+                        all(type(m) is dict for m in conversations)
+                        and [m.get("from") for m in conversations] == ["human", "gpt"],
+                        "invalid_qa_roles_or_text",
+                    )
                     validate_source_chain(conversations[1].get("value"))
                     reference_field = spec.get("reference_field")
                     if reference_field:
@@ -148,7 +165,10 @@ def adapt_records(original, spec, checksum, row, config):
             allowed is not None and category not in allowed
         ):
             error = "source_category_out_of_scope"
-        if record.policy["task_type"] in {"pure_ocr", "box_grounding"}:
+        if not is_v3(config) and record.policy["task_type"] in {
+            "pure_ocr",
+            "box_grounding",
+        }:
             error = "non_cot_task_out_of_scope"
         if reference_missing:
             policy["reference_grade"] = "unknown"

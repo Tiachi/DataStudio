@@ -292,6 +292,66 @@ class MockAPI:
                         }
                     ).decode()
                 }
+                if any(
+                    p.get("type") == "system"
+                    and "image_cot.effort_rating/2" in str(p.get("value"))
+                    for p in task.payload
+                ):
+                    message = {
+                        "content": canonical(
+                            {
+                                "schema_version": "image_cot.effort_rating/2",
+                                "task_status": "answerable",
+                                "effort_cap": "high",
+                                "reason": "synthetic quality rating",
+                                "checks": [
+                                    {
+                                        "kind": k,
+                                        "claim": "synthetic " + k,
+                                        "evidence_source": "question",
+                                        "finding": "supported",
+                                        "reason": "scripted fixture",
+                                    }
+                                    for k in (
+                                        "question_quality",
+                                        "reference_quality",
+                                        "reasoning_need",
+                                        "effort",
+                                    )
+                                ],
+                            }
+                        ).decode()
+                    }
+            elif task.operation in {"answer_verify", "reasoning_verify"}:
+                answer_audit = task.operation == "answer_verify"
+                message = {
+                    "content": canonical(
+                        {
+                            "schema_version": "cot.answer_judgment/1"
+                            if answer_audit
+                            else "cot.reasoning_judgment/1",
+                            "status": "pass",
+                            "failure_kind": "none",
+                            "critical_errors": [],
+                            "uncertainties": [],
+                            "checks": [
+                                {
+                                    "kind": k,
+                                    "claim": "synthetic " + k,
+                                    "evidence_source": "candidate_answer",
+                                    "finding": "supported",
+                                    "reason": "scripted fixture",
+                                }
+                                for k in (
+                                    ("answer", "instruction")
+                                    if answer_audit
+                                    else ("reasoning", "consistency")
+                                )
+                            ],
+                            "reason": "synthetic text audit, not semantic validation",
+                        }
+                    ).decode()
+                }
             elif task.operation == "question_check":
                 message = {
                     "content": canonical(

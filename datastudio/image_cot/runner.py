@@ -42,7 +42,7 @@ from .operations import (
     verify_final,
 )
 from .storage import RunStore, atomic_bytes, atomic_json, read_json, read_jsonl
-from .policy import is_v2, stage_roles
+from .policy import is_v2, is_v3, stage_roles
 
 LOG = logging.getLogger("image_cot")
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -259,6 +259,7 @@ class Budget:
         self.events = []
         self.timings = Counter()
         self.cache_hits = 0
+        self.stage_statistics = {}
         # Enumerate only known input parts/fixed stage names, never media or all runs.
         for index in range(len(manifest["parts"])):
             for stage in stage_roles(config):
@@ -516,7 +517,11 @@ class StageDispatcher:
                     "completion_sink_identity",
                     InvariantError,
                 )
+                sink_started = time.monotonic()
                 self.store.append_receipts(self.part, [receipt.to_dict()])
+                self.budget.timings["receipt_fsync_s"] += (
+                    time.monotonic() - sink_started
+                )
                 persisted.add(receipt.task_id)
 
             self.model.receipt_sink = persist_completion
@@ -648,16 +653,20 @@ def execute_stage(
 ):
     if not records:
         return {}
+    from .split_audit import TEXT_AUDITS
+
     candidates = candidates or {}
     role = stage_roles(config)[stage]
     operation = role
     recipe = budget.stage_recipes[role]
-    candidate_review = role in {"joint_verify", "text_verify"}
+    candidate_review = role in {"joint_verify", "text_verify", *TEXT_AUDITS}
+    text_only = role in {"text_verify", *TEXT_AUDITS}
     is_verifier = role in {
         "question_check",
         "effort_rating",
         "joint_verify",
         "text_verify",
+        *TEXT_AUDITS,
     }
     candidate_ids = {
         source.question_id: (
@@ -673,7 +682,10 @@ def execute_stage(
         recipe,
         None,
         candidate_ids=candidate_ids,
-        settings=config.get("policy", {}),
+        settings={
+            **config.get("policy", {}),
+            "_schema_version": config["schema_version"],
+        },
     )
     tasks = []
     for source in records:
@@ -709,14 +721,20 @@ def execute_stage(
         budget.cache_hits += 1
         manifest = store.verify_commit(part)
         outcomes = list(read_jsonl(part / manifest["results"], store.max_line_bytes))
-        return _stage_outputs(outcomes, store, part, role)
+        return record_stage_statistics(
+            budget, stage, _stage_outputs(outcomes, store, part, role)
+        )
     handle = handles.setdefault(role, ModelHandle(config, role, backend))
     context.dispatch = StageDispatcher(
         store, part, handle, budget, role, _reuse_parts(config, input_part, stage)
     )
     builder = {
         "type": (
-            "VerificationRequestBuilder"
+            "TextAuditRequestBuilder"
+            if role in TEXT_AUDITS
+            else "QualityRatingRequestBuilder"
+            if role == "effort_rating" and is_v3(config)
+            else "VerificationRequestBuilder"
             if candidate_review
             else (
                 "RatingRequestBuilder" if role == "effort_rating" else "RequestBuilder"
@@ -725,7 +743,7 @@ def execute_stage(
         "prompt": None if is_verifier else config["models"][role]["prompt"],
         "system_prompt": config["models"][role]["prompt"] if is_verifier else None,
         "key_templates": None,
-        "with_image": role != "text_verify",
+        "with_image": not text_only,
         "with_question": True,
         "with_answer": candidate_review,
         "with_original": candidate_review,
@@ -744,7 +762,7 @@ def execute_stage(
         for op in subpipeline.operators:
             op.bind_context(context)
     for batch in iter_microbatches(
-        records, config["limits"], with_image=role != "text_verify"
+        records, stage_batch_limits(config, role), with_image=not text_only
     ):
         started = time.monotonic()
         datas = (
@@ -758,7 +776,7 @@ def execute_stage(
                 }
                 for s in batch
             ]
-            if role == "text_verify"
+            if text_only
             else load_images(batch, config["limits"]["max_decoded_pixels_per_batch"])
         )
         budget.timings["decode_s"] += time.monotonic() - started
@@ -788,7 +806,84 @@ def execute_stage(
     started = time.monotonic()
     store.commit_part(part, outcomes)
     budget.timings["part_commit_s"] += time.monotonic() - started
-    return _stage_outputs(outcomes, store, part, role)
+    return record_stage_statistics(
+        budget, stage, _stage_outputs(outcomes, store, part, role)
+    )
+
+
+def stage_batch_limits(config, role):
+    limits = dict(config["limits"])
+    model = config["models"][role]
+    pool = config.get("quota_pools", {}).get(model.get("quota_pool"))
+    if pool:
+        maximum = min(
+            limits["requests_per_microbatch"],
+            pool["rpm"],
+            pool["input_tpm"] // pool["input_tokens_per_request"],
+            pool["output_tpm"] // model["max_output_tokens"],
+        )
+        require(maximum >= 1, f"single_request_exceeds_quota:{role}")
+        limits["requests_per_microbatch"] = maximum
+    return limits
+
+
+def record_stage_statistics(budget, stage, results):
+    stats = {
+        "planned": 0,
+        "outcomes": Counter(
+            {s: 0 for s in ("pass", "fail", "uncertain", "error", "not_dispatched")}
+        ),
+        "reasons": Counter(),
+        "failure_kinds": Counter(),
+        "requests_with_receipt": 0,
+        "usage_known": 0,
+        "usage_unknown": 0,
+        "prompt_tokens_observed": 0,
+        "completion_tokens_observed": 0,
+        "response_elapsed_s": 0.0,
+    }
+    for row in results.values():
+        stats["planned"] += 1
+        stats["outcomes"][row["status"]] += 1
+        stats["reasons"][row["reason"]] += 1
+        stats["failure_kinds"][row.get("failure_kind", "unspecified")] += 1
+        receipt = row.get("receipt_summary")
+        if receipt:
+            stats["requests_with_receipt"] += 1
+            stats["response_elapsed_s"] += receipt["elapsed_s"]
+            usage = receipt["usage"]
+            valid = type(usage) is dict and all(
+                type(usage.get(k)) is int and usage[k] >= 0
+                for k in ("prompt_tokens", "completion_tokens")
+            )
+            stats["usage_known" if valid else "usage_unknown"] += 1
+            if valid:
+                stats["prompt_tokens_observed"] += usage["prompt_tokens"]
+                stats["completion_tokens_observed"] += usage["completion_tokens"]
+    total = budget.stage_statistics.setdefault(
+        stage,
+        {
+            key: Counter() if isinstance(value, Counter) else 0
+            for key, value in stats.items()
+        },
+    )
+    for key, value in stats.items():
+        if isinstance(value, Counter):
+            total[key].update(value)
+        else:
+            total[key] += value
+    if results:
+        refs = parent_refs(results)
+        atomic_json(
+            budget.store.root / "statistics" / stage / (identity(refs) + ".json"),
+            {
+                "schema_version": "image_cot.stage_statistics/1",
+                "stage": stage,
+                "parent_commits": refs,
+                **stats,
+            },
+        )
+    return results
 
 
 def parent_refs(*groups):
@@ -816,6 +911,12 @@ def _stage_outputs(outcomes, store, part, role):
             "task_id": row["task_id"],
             "commit_sha256": commit_digest,
         }
+        saved_receipt = recovery["receipts"].get(row["task_id"])
+        if saved_receipt:
+            row["receipt_summary"] = {
+                "elapsed_s": saved_receipt.get("elapsed_s", 0.0),
+                "usage": (saved_receipt.get("raw") or {}).get("usage"),
+            }
         if (role in {"short", "long"} or role.startswith("generate_")) and row.get(
             "text_hash"
         ):
@@ -899,6 +1000,10 @@ def run(config, *, backend="http", limit=None):
         handles = {}
         counts = Counter()
         effort_outcomes, reasons, source_outcomes = Counter(), Counter(), Counter()
+        rating_distribution = Counter(
+            {k: 0 for k in ("none", "low", "high", "max", "not_rated")}
+        )
+        rating_decisions = Counter()
         selection_parts = []
         for index, prepared_part in enumerate(manifest["parts"]):
             input_part = f"input-{index:06d}"
@@ -916,7 +1021,10 @@ def run(config, *, backend="http", limit=None):
                 InvariantError,
             )
             if is_v2(config):
-                from .runner_v2 import process_part
+                if is_v3(config):
+                    from .runner_v3 import process_part
+                else:
+                    from .runner_v2 import process_part
 
                 selections = process_part(
                     records,
@@ -1117,6 +1225,16 @@ def run(config, *, backend="http", limit=None):
             if is_v2(config):
                 names = {r.question_id: r.source for r in records}
                 for selected in selections:
+                    if "rated_cap" in selected:
+                        rating_distribution[selected["rated_cap"]] += 1
+                    elif not selected.get("rating_ref"):
+                        rating_distribution["not_rated"] += 1
+                    rating_decisions[
+                        selected.get(
+                            "rating_task_status",
+                            "rated" if selected.get("rating_ref") else "not_eligible",
+                        )
+                    ] += 1
                     reasons[selected["reason"]] += 1
                     source_outcomes[
                         names[selected["question_id"]] + ":" + selected["terminal"]
@@ -1163,11 +1281,16 @@ def run(config, *, backend="http", limit=None):
             "student_training_verified": False,
         }
         if is_v2(config):
+            for stage in stage_roles(config):
+                record_stage_statistics(budget, stage, {})
             report.update(
                 effort_outcomes=dict(effort_outcomes),
                 terminal_reasons=dict(reasons),
                 source_outcomes=dict(source_outcomes),
                 review_mode=config["policy"]["review_mode"],
+                stage_statistics=budget.stage_statistics,
+                rating_distribution=dict(rating_distribution),
+                rating_decisions=dict(rating_decisions),
             )
         atomic_json(store.root / "report.json", report)
         observation = {
