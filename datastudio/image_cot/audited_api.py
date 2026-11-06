@@ -57,6 +57,18 @@ class AuditedOpenAIAPI(OpenAIAPI):
         self._active = Lock()
         self._task_map = {}
         self._received = {}
+        self._receipt_sink = None
+        self._sink_error = None
+
+    def _record_receipt(self, receipt):
+        # The completion is not delivered until the private journal is durable.
+        if self._receipt_sink is not None:
+            try:
+                self._receipt_sink(receipt)
+            except Exception as exc:
+                self._sink_error = exc
+                raise
+        self._received[receipt.task_id] = receipt
 
     def encode_image_directly(self, image):
         # Reuse upstream pre-encoding/dedup; keep text/chart details losslessly.
@@ -96,6 +108,8 @@ class AuditedOpenAIAPI(OpenAIAPI):
         }
 
     async def _request_non_streaming(self, session, message, **kwargs):
+        if self._sink_error is not None:
+            raise self._sink_error
         task = self._task_map[id(message)]
         payload = self._build_payload(message)
         encoded = canonical(payload)
@@ -108,7 +122,7 @@ class AuditedOpenAIAPI(OpenAIAPI):
                 error="request_body_limit",
                 request_digest=request_digest,
             )
-            self._received[task.task_id] = receipt
+            self._record_receipt(receipt)
             return 0, receipt
         started = time.monotonic()
         try:
@@ -127,8 +141,13 @@ class AuditedOpenAIAPI(OpenAIAPI):
                             error="response_body_limit",
                             elapsed_s=time.monotonic() - started,
                             request_digest=request_digest,
+                            raw={
+                                "_partial_body_base64": base64.b64encode(body).decode(
+                                    "ascii"
+                                )
+                            },
                         )
-                        self._received[task.task_id] = receipt
+                        self._record_receipt(receipt)
                         return 0, receipt
                     body.extend(block)
                 try:
@@ -154,9 +173,11 @@ class AuditedOpenAIAPI(OpenAIAPI):
                     elapsed_s=time.monotonic() - started,
                     request_digest=request_digest,
                 )
-                self._received[task.task_id] = receipt
+                self._record_receipt(receipt)
                 return 0, receipt
         except (asyncio.TimeoutError, OSError):
+            if self._sink_error is not None:
+                raise self._sink_error
             receipt = GenerationReceipt(
                 task.task_id,
                 task.attempt_id,
@@ -165,16 +186,18 @@ class AuditedOpenAIAPI(OpenAIAPI):
                 elapsed_s=time.monotonic() - started,
                 request_digest=request_digest,
             )
-            self._received[task.task_id] = receipt
+            self._record_receipt(receipt)
             return 0, receipt
 
-    def generate_audited(self, tasks, *, deadline_s=None):
+    def generate_audited(self, tasks, *, deadline_s=None, receipt_sink=None):
         require(
             self._active.acquire(blocking=False),
             "model_batch_already_active",
             InvariantError,
         )
         messages = []
+        self._receipt_sink = receipt_sink
+        self._sink_error = None
         deadline = time.monotonic() + min(
             self.role_config["batch_deadline_s"],
             (
@@ -198,11 +221,13 @@ class AuditedOpenAIAPI(OpenAIAPI):
                     self._task_map[id(processed)] = task
                     prepared.append(processed)
                 except (ValueError, TypeError, AssertionError, OSError):
-                    self._received[task.task_id] = GenerationReceipt(
-                        task.task_id,
-                        task.attempt_id,
-                        "error",
-                        error="preprocess_failed_no_dispatch",
+                    self._record_receipt(
+                        GenerationReceipt(
+                            task.task_id,
+                            task.attempt_id,
+                            "error",
+                            error="preprocess_failed_no_dispatch",
+                        )
                     )
 
             async def execute():
@@ -217,6 +242,9 @@ class AuditedOpenAIAPI(OpenAIAPI):
 
             if prepared and time.monotonic() < deadline:
                 asyncio.run(execute())
+            # The parent engine catches per-request errors. Never hide a disk error.
+            if self._sink_error is not None:
+                raise self._sink_error
             return [
                 self._received.get(task.task_id)
                 or GenerationReceipt(
@@ -230,6 +258,8 @@ class AuditedOpenAIAPI(OpenAIAPI):
         finally:
             self._task_map.clear()
             self._received.clear()
+            self._receipt_sink = None
+            self._sink_error = None
             messages.clear()
             self._active.release()
 
@@ -239,17 +269,29 @@ class MockAPI:
 
     model = "synthetic-image-cot-mock"
 
-    def generate_audited(self, tasks):
+    def generate_audited(self, tasks, *, receipt_sink=None):
         receipts = []
         for task in tasks:
-            if task.operation in {"short", "long"}:
+            if task.operation in {"short", "long"} or task.operation.startswith(
+                "generate_"
+            ):
                 message = {
                     "content": "The synthetic chart shows two marked groups.\nAnswer: 2"
                 }
-                if task.operation == "long":
+                if task.operation == "long" or task.operation.startswith("generate_"):
                     message["reasoning_content"] = (
                         "Read the two groups in this synthetic fixture."
                     )
+            elif task.operation == "effort_rating":
+                message = {
+                    "content": canonical(
+                        {
+                            "schema_version": "image_cot.effort_rating/1",
+                            "effort_cap": "high",
+                            "reason": "synthetic rating; not a real difficulty estimate",
+                        }
+                    ).decode()
+                }
             elif task.operation == "question_check":
                 message = {
                     "content": canonical(
@@ -284,14 +326,42 @@ class MockAPI:
                         }
                     ).decode()
                 }
+            if task.operation == "text_verify":
+                value = strict_json(message["content"])
+                value["schema_version"] = "image_cot.text_judgment/1"
+                value.pop("visual_status", None)
+                value["checks"] = [
+                    {
+                        "kind": "reasoning",
+                        "claim": "synthetic explanation",
+                        "evidence_source": "question",
+                        "finding": "supported",
+                        "reason": "scripted text audit, not visual evidence",
+                    }
+                ]
+                message["content"] = canonical(value).decode()
+            if task.operation in {"text_verify", "joint_verify"}:
+                value = strict_json(message["content"])
+                value["checks"].extend(
+                    {
+                        "kind": kind,
+                        "claim": "synthetic " + kind,
+                        "evidence_source": "candidate",
+                        "finding": "supported",
+                        "reason": "scripted fixture, not semantic verification",
+                    }
+                    for kind in ("answer", "reasoning", "instruction")
+                )
+                message["content"] = canonical(value).decode()
             raw = {
                 "model": self.model,
                 "choices": [{"message": message, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 20},
             }
-            receipts.append(
-                GenerationReceipt(
-                    task.task_id, task.attempt_id, "received", raw=raw, http_status=200
-                )
+            receipt = GenerationReceipt(
+                task.task_id, task.attempt_id, "received", raw=raw, http_status=200
             )
+            if receipt_sink is not None:
+                receipt_sink(receipt)
+            receipts.append(receipt)
         return receipts

@@ -68,7 +68,7 @@ def render_candidate(receipt, stage):
             and re.fullmatch(r"\s*<think>.*?</think>\s*\S.*", content, re.S),
             "invalid_think_boundaries",
         )
-        if stage == "long":
+        if stage == "long" or stage.startswith("generate_"):
             require(
                 bool(re.search(r"<think>\s*\S.*?</think>", content, re.S)),
                 "missing_long_reasoning",
@@ -114,14 +114,104 @@ def check_candidate(text, policy):
     return {"status": "pass", "reason": "local_structure_pass"}
 
 
-def extract_final(text):
+def extract_final(text, answer_format="answer_line"):
     outside = text.split("</think>", 1)[-1]
+    if answer_format == "plain":
+        return outside.strip() or None
+    if answer_format == "boxed":
+        starts = list(re.finditer(r"\\(?:boxed|box)\{", outside))
+        if len(starts) != 1:
+            return None
+        start, depth = starts[0].end(), 1
+        for pos in range(start, len(outside)):
+            if outside[pos] == "{":
+                depth += 1
+            elif outside[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    return outside[start:pos].strip() or None
+        return None
+    require(answer_format == "answer_line", "unregistered_final_format")
     matches = re.findall(
         r"(?im)^\s*(?:Answer|Final Answer|最终答案|答案)\s*[:：]\s*(.+?)\s*$", outside
     )
     if len(matches) != 1:
         return None
     return matches[0].strip()
+
+
+def parse_rating(receipt, tiers):
+    try:
+        value = strict_json(completed_message(receipt)["content"])
+        require(
+            type(value) is dict
+            and value.get("schema_version") == "image_cot.effort_rating/1"
+            and value.get("effort_cap") in tiers
+            and type(value.get("reason")) is str
+            and value["reason"].strip(),
+            "rating_schema",
+        )
+        return {
+            "status": "pass",
+            "reason": value["reason"],
+            "effort_cap": value["effort_cap"],
+        }
+    except (ConfigurationError, TypeError):
+        return {"status": "error", "reason": "rating_schema_error"}
+
+
+def parse_text_judgment(receipt, policy):
+    """Reuse evidence checks without allowing a text judge to claim image inspection."""
+    from dataclasses import replace
+
+    try:
+        value = strict_json(completed_message(receipt)["content"])
+        require(
+            type(value) is dict
+            and value.get("schema_version") == "image_cot.text_judgment/1"
+            and "visual_status" not in value
+            and type(value.get("checks")) is list
+            and bool(value["checks"]),
+            "text_judgment_schema",
+        )
+        require(
+            all(
+                type(c) is dict
+                and c.get("kind") != "visual"
+                and c.get("evidence_source")
+                in {"question", "reference", "candidate", "task_policy"}
+                for c in value["checks"]
+            ),
+            "text_judge_cannot_inspect_image",
+        )
+        value = {
+            **value,
+            "schema_version": "image_cot.judgment/1",
+            "visual_status": "pass",
+        }
+        raw = {
+            **receipt.raw,
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": canonical(value).decode()},
+                }
+            ],
+        }
+        result = parse_judgment(
+            replace(receipt, raw=raw), {**policy, "visual_evidence_required": False}
+        )
+        if "judgment" in result:
+            result["judgment"].pop("visual_status")
+            result["judgment"]["schema_version"] = "image_cot.text_judgment/1"
+        result["visual_audit"] = "not_checked"
+        return result
+    except (ConfigurationError, TypeError):
+        return {
+            "status": "error",
+            "reason": "text_judge_schema_error",
+            "visual_audit": "not_checked",
+        }
 
 
 def _number_unit(value):
@@ -149,7 +239,7 @@ def verify_final(text, source):
     task_type = policy["task_type"]
     if task_type == "open":
         return {"status": "pass", "reason": "open_conclusion_requires_joint_judge"}
-    final = extract_final(text)
+    final = extract_final(text, policy.get("final_format", "answer_line"))
     if final is None:
         return {"status": "uncertain", "reason": "ambiguous_final_extraction"}
     if task_type == "mcq":
@@ -317,6 +407,14 @@ def parse_judgment(receipt, policy):
             for c in value["checks"]
         ):
             status = "uncertain"
+        elif policy.get("evidence_contract") == "v2" and not all(
+            any(
+                c["kind"] == kind and c["finding"] == "supported"
+                for c in value["checks"]
+            )
+            for kind in ("answer", "reasoning", "instruction")
+        ):
+            status = "uncertain"
         else:
             status = "pass"
         return {"status": status, "reason": value["reason"], "judgment": value}
@@ -368,6 +466,20 @@ def decide_route(
 
 
 @REQUESTS.register_module()
+class RatingRequestBuilder(RequestBuilder):
+    def bind_context(self, context):
+        self.context = context
+
+    def format_content(self, item, qa_idx):
+        return canonical(
+            {
+                "question": item.get_qa(qa_idx).question,
+                "supported_caps": self.context.settings["tiers"],
+            }
+        ).decode()
+
+
+@REQUESTS.register_module()
 class VerificationRequestBuilder(RequestBuilder):
     def bind_context(self, context):
         self.context = context
@@ -396,7 +508,8 @@ def execute_audited_batch(operator, items, context):
     tasks = []
     for item in items:
         require(
-            item.qa_count == 1 and item.image is not None,
+            item.qa_count == 1
+            and (item.image is not None or context.operation == "text_verify"),
             "single_decoded_image_qa_required",
             InvariantError,
         )
@@ -428,6 +541,10 @@ def execute_audited_batch(operator, items, context):
             outcome = (
                 parse_question_check(receipt)
                 if context.operation == "question_check"
+                else parse_rating(receipt, context.settings["tiers"])
+                if context.operation == "effort_rating"
+                else parse_text_judgment(receipt, source.policy)
+                if context.operation == "text_verify"
                 else parse_judgment(receipt, source.policy)
             )
         else:
@@ -481,7 +598,7 @@ def make_model_task(context, question_id, payload, answer=None):
 
 def task_input_digest(source, candidate, answer, operation):
     inputs = [source.question_id, source.media_sha256, candidate, answer]
-    if operation == "joint_verify":
+    if operation in {"joint_verify", "text_verify"}:
         inputs.append(
             {
                 "source_reference": source.reference,
@@ -523,7 +640,9 @@ class _ContextMixin:
 
     def bind_context(self, context):
         self.context = context
-        if isinstance(self.request_builder, VerificationRequestBuilder):
+        if isinstance(
+            self.request_builder, (VerificationRequestBuilder, RatingRequestBuilder)
+        ):
             self.request_builder.bind_context(context)
 
     def process_batch(self, items):

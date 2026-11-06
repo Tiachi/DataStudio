@@ -1,16 +1,24 @@
 # DataStudio · 图片 CoT SFT 数据构建
 
 基于 [Open-Bee/DataStudio](https://github.com/Open-Bee/DataStudio) 的可选扩展：从已有图片 QA
-构建可追溯、可审核的短/长 CoT，导出用于 SFT 的 JSONL。本分支入口是
+构建可追溯、可审核的原生 CoT，导出用于 SFT 的 JSONL。本分支入口是
 [`run_image_cot.py`](run_image_cot.py)，不是上游清洗示例的 `run.py`。
 
 **当前分支：`codex/image-cot-v1`。** 已完成本地实现验证；真实教师效果、生产吞吐与学生训练收益待验证。
 
+**新任务使用 v2 评级封顶产线：** QA/Honey 全部重新生成，可跳过图题检查；评级作为上限，
+从 low 起按 low→high→max 递进，首条合格即停。评级 high 时 high 失败即拒绝，绝不调用 max。
+Kimi 使用其原生 reasoning/content，生成默认只传图片与问题；文本审核显式标记未做视觉核验。
+先读 **[v2 完整操作手册与改造说明](docs/image_cot_v2_operations.md)**，配置入口为
+[kimi_cascade.py](configs/image_cot/kimi_cascade.py)。后文的双档图与 base/pilot 示例为兼容的 v1 路线。
+
 | 阅读目标 | 文档 |
 |---|---|
-| 从安装开始，一步一步运行 | **[详细操作手册](docs/image_cot_operations_manual.md)** |
+| 使用新产线：格式盘点、Honey 重生成、评级硬上限、三种审核 | **[v2 操作手册](docs/image_cot_v2_operations.md)** |
+| 安装与旧版双档示例 | [v1 操作手册](docs/image_cot_operations_manual.md) |
 | 理解模块、实现取舍和边界 | [实现说明](docs/image_cot_implementation.md) |
 | 查看测试范围和证据 | [523 项本地验证记录](docs/image_cot_validation_2026-11-05.md) |
+| 查看 v2 与兼容性验证 | [v2 验证记录](docs/image_cot_v2_validation_2026-11-06.md) |
 | 使用上游通用数据清洗框架 | [原中文指南](docs/guide/readme_zh.md) |
 
 ## 1. 这个项目解决什么问题
@@ -18,13 +26,13 @@
 输入已经存在的图片、问题和参考答案。教师生成时不读取参考答案；生成后检查终答、视觉依据、
 关键推理与指令完整性，再决定接受、拒绝、人工复核或升级长链。训练输出保留审核通过的正文。
 
-适用于选择题、数值题和已有可靠参考的开放式视觉推理。纯 OCR 转写和框坐标任务走原标注旁路，
-单独记录，不强行制造推理。首版每题只选一条合格链，控制重复曝光。
+v2 面向非数学解题、非代码任务的图片推理，包括简单视觉计数和有可靠参考的开放题。纯 OCR 和框坐标
+不进入 v2 CoT 生成；旧版仍有原标注旁路。每题默认只选一条合格链，控制重复曝光。
 
 Honey-Data-V2 是配方参考。本扩展复用 DataStudio 算子与 API 引擎，但不声称一键复现其完整生产配方。
 与学生 DeepSeek/GLM 的实际训练接线通过独立 probe 验证，API 的 thinking 开关不代替 SFT 编码验证。
 
-## 2. 当前能力与状态
+## 2. v1 兼容路线能力与状态
 
 | 能力 | 当前行为 |
 |---|---|
@@ -40,9 +48,10 @@ Honey-Data-V2 是配方参考。本扩展复用 DataStudio 算子与 API 引擎�
 | 本地验证 | Windows/Python 3.13.9：56 项扩展＋467 项上游测试，共 523 项通过 |
 | 尚未验收 | 真实端点、代表性 CoT 人审、生产速率、目标 SFS、学生训练 |
 
-不包含多图/多轮、Honey 嵌套格式导入、交错裁图、PRM、GRPO、自动重发未知请求或在线学生训练。
+多图/多轮、交错裁图、PRM、GRPO、自动重发未知请求或在线学生训练不在当前范围。
+Honey 嵌套对话导入由 v2 专用 adapter 支持；需先将 HF Image 材料化为本地媒体路径。
 
-## 3. 数据产出链路
+## 3. v1 数据产出链路（v2 见新手册）
 
 ```mermaid
 flowchart TD

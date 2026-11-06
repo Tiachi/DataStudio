@@ -121,6 +121,8 @@ def verified_selection(run_root):
 
 
 def selected_text(selection, source, store):
+    if selection.get("schema_version") == "image_cot.selection/2":
+        return selected_text_v2(selection, source, store)
     generation, receipt, _plan = verified_ref(store, selection["receipt_ref"])
     require(
         generation["status"] == "pass"
@@ -164,6 +166,90 @@ def selected_text(selection, source, store):
         judge_status == "pass" and verify_final(text, source)["status"] == "pass",
         "revalidated_candidate_not_pass",
     )
+    return text
+
+
+def selected_text_v2(selection, source, store):
+    """Recompute the cap and every audit from durable receipts, not selection flags."""
+    from .operations import (
+        parse_rating,
+        parse_question_check,
+        parse_text_judgment,
+        check_candidate,
+    )
+    from .policy import EFFORTS, cap_for
+
+    config = read_json(store.root / "run.json")["config"]
+    policy = config["policy"]
+    rated = None
+    if source.policy["qa_check_enabled"]:
+        outcome, raw, _ = verified_ref(store, selection["question_check_ref"])
+        require(
+            outcome["question_id"] == source.question_id
+            and parse_question_check(raw)["status"] == "pass",
+            "v2_question_revalidation",
+        )
+    if source.policy["rating_enabled"]:
+        outcome, raw, _ = verified_ref(store, selection["rating_ref"])
+        rating = parse_rating(raw, policy["tiers"])
+        require(
+            outcome["question_id"] == source.question_id and rating["status"] == "pass",
+            "v2_rating_revalidation",
+        )
+        rated = rating["effort_cap"]
+    cap = cap_for(source, policy, rated)
+    require(
+        selection["effort_cap"] == cap
+        and selection["effort"] in policy["tiers"]
+        and EFFORTS.index(selection["effort"]) <= EFFORTS.index(cap)
+        and selection["stage"] == f"generate_{selection['effort']}",
+        "export_effort_cap_violation",
+    )
+    generation, receipt, plan = verified_ref(store, selection["receipt_ref"])
+    text = render_candidate(receipt, selection["stage"])
+    require(
+        plan["stage"] == selection["stage"]
+        and generation["status"] == "pass"
+        and generation["question_id"] == source.question_id
+        and generation["candidate_id"] == selection["candidate_id"]
+        and generation["recipe_signature"] == selection["recipe_signature"]
+        and identity(text) == selection["text_hash"] == generation["text_hash"]
+        and check_candidate(text, source.policy)["status"] == "pass"
+        and verify_final(text, source)["status"] == "pass",
+        "v2_generation_revalidation",
+    )
+    modes = {
+        "text_only": ["text_verify"],
+        "visual_joint": ["joint_verify"],
+        "text_then_visual": ["text_verify", "joint_verify"],
+    }
+    expected = modes[policy["review_mode"]]
+    require(
+        selection["review_mode"] == policy["review_mode"]
+        and [a["role"] for a in selection["audit_refs"]] == expected,
+        "v2_review_role_coverage",
+    )
+    require(
+        selection["visual_audit"]
+        == ("checked" if "joint_verify" in expected else "not_checked"),
+        "v2_visual_scope_mismatch",
+    )
+    for audit in selection["audit_refs"]:
+        judgment, raw, plan = verified_ref(store, audit["receipt_ref"])
+        role = audit["role"]
+        parser = parse_text_judgment if role == "text_verify" else parse_judgment
+        task = next(t for t in plan["tasks"] if t["task_id"] == judgment["task_id"])
+        require(
+            judgment["status"] == "pass"
+            and judgment["question_id"] == source.question_id
+            and judgment["candidate_id"] == selection["candidate_id"]
+            and judgment["recipe_signature"] == audit["recipe_signature"]
+            and task["operation"] == role
+            and task["input_digest"]
+            == task_input_digest(source, selection["candidate_id"], text, role)
+            and parser(raw, source.policy)["status"] == "pass",
+            "v2_judgment_revalidation",
+        )
     return text
 
 
@@ -392,7 +478,13 @@ def export_training(run_root, *, preview=True, export_policy=None):
             "MAINTAINER": policy.get("maintainer") or "待指定",
             "INTRODUCTION": f"合格图片CoT：{count}条；modal_mask=1。源：{', '.join(sorted(source_names))}。旁路{bypass_count}条未混入CoT。",
             "ORIGINAL_FIELDS": "| 字段 | 类型 | 说明 |\n|---|---|---|\n" + fields,
-            "PROCESSING": "短链生成、严格终答/视觉/过程审核、选择性长链；原始媒体未修改。原始字段映射："
+            "PROCESSING": (
+                "统一重新生成；评级为硬上限；从low起首个合格即停；审核模式="
+                + spec["config"]["policy"]["review_mode"]
+                + "。text_only未逐条核验视觉事实；原始媒体未修改。原始字段映射："
+                if spec["config"]["schema_version"] == "image_cot.config/2"
+                else "短链生成、严格终答/视觉/过程审核、选择性长链；原始媒体未修改。原始字段映射："
+            )
             + canonical(policy.get("original_field_mapping", {})).decode(),
             "PATHS": "训练JSON中的images相对于配置的training_media_root；逐条校验媒体摘要。工作目录路径不代表服务器已发布。",
         }

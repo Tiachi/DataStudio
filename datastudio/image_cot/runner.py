@@ -42,6 +42,7 @@ from .operations import (
     verify_final,
 )
 from .storage import RunStore, atomic_bytes, atomic_json, read_json, read_jsonl
+from .policy import is_v2, stage_roles
 
 LOG = logging.getLogger("image_cot")
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -100,7 +101,12 @@ def prepare(config, *, limit=None):
     descriptions = []
     for source in sources:
         require(
-            source.get("schema") == "standard_qa_v1"
+            source.get("schema")
+            in (
+                {"standard_qa_v1", "honey_data_v2"}
+                if is_v2(config)
+                else {"standard_qa_v1"}
+            )
             and source.get("name")
             and source.get("revision")
             and type(source.get("task_policy")) is dict,
@@ -132,6 +138,10 @@ def prepare(config, *, limit=None):
         "part_bytes": config["limits"]["source_bytes_per_part"],
         "prepare_code": implementation_identity()["code_digest"],
     }
+    if is_v2(config):
+        from .policy import source_policy
+
+        recipe["v2_defaults"] = source_policy({}, config)
     input_digest = identity(recipe)
     target = root / "prepared" / input_digest
     require(within(target, root), "prepared_output_path_escape")
@@ -176,21 +186,33 @@ def prepare(config, *, limit=None):
                         raise ConfigurationError(
                             f"malformed_source_json_line:{row_number}"
                         ) from exc
-                    record = validate_input(original, source, checksum, row_number)
-                    encoded_size = len(canonical(record.to_dict())) + 1
-                    require(
-                        encoded_size <= config["limits"]["source_bytes_per_part"],
-                        "prepared_record_too_large",
-                    )
-                    if rows and (
-                        len(rows) >= recipe["part_records"]
-                        or size + encoded_size > recipe["part_bytes"]
-                    ):
-                        flush()
-                    rows.append(record.to_dict())
-                    size += encoded_size
-                    total += 1
-                    invalid += record.input_outcome != "pass"
+                    if is_v2(config):
+                        from .adapters import adapt_records
+
+                        adapted = adapt_records(
+                            original, source, checksum, row_number, config
+                        )
+                    else:
+                        adapted = [
+                            validate_input(original, source, checksum, row_number)
+                        ]
+                    for record in adapted:
+                        if limit is not None and total >= limit:
+                            break
+                        encoded_size = len(canonical(record.to_dict())) + 1
+                        require(
+                            encoded_size <= config["limits"]["source_bytes_per_part"],
+                            "prepared_record_too_large",
+                        )
+                        if rows and (
+                            len(rows) >= recipe["part_records"]
+                            or size + encoded_size > recipe["part_bytes"]
+                        ):
+                            flush()
+                        rows.append(record.to_dict())
+                        size += encoded_size
+                        total += 1
+                        invalid += record.input_outcome != "pass"
             require(file_hash(path) == checksum, "source_changed_during_prepare")
             flush()  # Source roots/policies never get mixed by a loader.
             if limit is not None and total >= limit:
@@ -239,13 +261,7 @@ class Budget:
         self.cache_hits = 0
         # Enumerate only known input parts/fixed stage names, never media or all runs.
         for index in range(len(manifest["parts"])):
-            for stage in (
-                "question_check",
-                "short",
-                "short_verify",
-                "long",
-                "long_verify",
-            ):
+            for stage in stage_roles(config):
                 directory = store.root / "parts" / f"input-{index:06d}" / stage
                 for part in sorted(directory.iterdir()) if directory.exists() else []:
                     if (part / "plan.json").is_file():
@@ -377,6 +393,8 @@ def stage_recipe(config, role, backend, code_digest=None):
         key: connection.get(key)
         for key in ("provider_profile", "api_base", "model", "declared_revision")
     }
+    if role == "effort_rating":
+        connection_signature["supported_caps"] = config["policy"]["tiers"]
     return identity(
         "image_cot.stage/1",
         role,
@@ -394,7 +412,7 @@ def stage_recipe(config, role, backend, code_digest=None):
                 "connection_ref",
             }
         },
-        file_hash(model["prompt"]),
+        file_hash(model["prompt"]) if model.get("prompt") else "native_question_only/1",
         {"image_encoding": "PNG", "resize": False},
         code_digest or implementation_identity()["code_digest"],
     )
@@ -486,9 +504,28 @@ class StageDispatcher:
             self.store.append_intents(self.part, intents)
             self.budget.timings["intent_fsync_s"] += time.monotonic() - started
             started = time.monotonic()
-            receipts = self.model.generate_audited(
-                fresh, deadline_s=self.budget.remaining_wall()
-            )
+            expected = {t.task_id: t for t in fresh}
+            persisted = set()
+
+            def persist_completion(receipt):
+                task = expected.get(receipt.task_id)
+                require(
+                    task is not None
+                    and receipt.attempt_id == task.attempt_id
+                    and receipt.task_id not in persisted,
+                    "completion_sink_identity",
+                    InvariantError,
+                )
+                self.store.append_receipts(self.part, [receipt.to_dict()])
+                persisted.add(receipt.task_id)
+
+            self.model.receipt_sink = persist_completion
+            try:
+                receipts = self.model.generate_audited(
+                    fresh, deadline_s=self.budget.remaining_wall()
+                )
+            finally:
+                self.model.receipt_sink = None
             self.budget.timings[f"{self.role}.model_batch_s"] += (
                 time.monotonic() - started
             )
@@ -501,9 +538,10 @@ class StageDispatcher:
                 and r.task_id in expected
                 and r.attempt_id == expected[r.task_id].attempt_id
             ]
-            if identifiable:
+            remaining = [r for r in identifiable if r["task_id"] not in persisted]
+            if remaining:
                 started = time.monotonic()
-                self.store.append_receipts(self.part, identifiable)
+                self.store.append_receipts(self.part, remaining)
                 self.budget.timings["receipt_fsync_s"] += time.monotonic() - started
             unidentifiable = [
                 r.to_dict()
@@ -525,11 +563,13 @@ class StageDispatcher:
         return [result[t.task_id] for t in tasks]
 
 
-def iter_microbatches(records, limits):
+def iter_microbatches(records, limits, *, with_image=True):
     batch, pixels = [], 0
     for record in records:
-        with Image.open(media_path(record.media, record.media_root)) as image:
-            count = image.width * image.height
+        count = 0
+        if with_image:
+            with Image.open(media_path(record.media, record.media_root)) as image:
+                count = image.width * image.height
         require(
             count <= limits["max_decoded_pixels_per_batch"],
             "single_image_exceeds_batch_pixel_budget",
@@ -570,9 +610,15 @@ class ModelHandle:
                 )
             )
         return (
-            self.instance.generate_audited(tasks)
+            self.instance.generate_audited(
+                tasks, receipt_sink=getattr(self, "receipt_sink", None)
+            )
             if self.backend == "mock"
-            else self.instance.generate_audited(tasks, deadline_s=deadline_s)
+            else self.instance.generate_audited(
+                tasks,
+                deadline_s=deadline_s,
+                receipt_sink=getattr(self, "receipt_sink", None),
+            )
         )
 
 
@@ -603,14 +649,20 @@ def execute_stage(
     if not records:
         return {}
     candidates = candidates or {}
-    role = "joint_verify" if stage.endswith("_verify") else stage
+    role = stage_roles(config)[stage]
     operation = role
     recipe = budget.stage_recipes[role]
-    is_verifier = role in {"question_check", "joint_verify"}
+    candidate_review = role in {"joint_verify", "text_verify"}
+    is_verifier = role in {
+        "question_check",
+        "effort_rating",
+        "joint_verify",
+        "text_verify",
+    }
     candidate_ids = {
         source.question_id: (
             candidates[source.question_id]["candidate_id"]
-            if is_verifier and role != "question_check"
+            if candidate_review
             else identity(source.question_id, recipe, role, 0)
         )
         for source in records
@@ -621,12 +673,13 @@ def execute_stage(
         recipe,
         None,
         candidate_ids=candidate_ids,
+        settings=config.get("policy", {}),
     )
     tasks = []
     for source in records:
         answer = (
             candidates[source.question_id]["text"]
-            if role == "joint_verify"
+            if candidate_review
             else source.reference
         )
         tasks.append(
@@ -663,15 +716,19 @@ def execute_stage(
     )
     builder = {
         "type": (
-            "VerificationRequestBuilder" if role == "joint_verify" else "RequestBuilder"
+            "VerificationRequestBuilder"
+            if candidate_review
+            else (
+                "RatingRequestBuilder" if role == "effort_rating" else "RequestBuilder"
+            )
         ),
         "prompt": None if is_verifier else config["models"][role]["prompt"],
         "system_prompt": config["models"][role]["prompt"] if is_verifier else None,
         "key_templates": None,
-        "with_image": True,
+        "with_image": role != "text_verify",
         "with_question": True,
-        "with_answer": role == "joint_verify",
-        "with_original": role == "joint_verify",
+        "with_answer": candidate_review,
+        "with_original": candidate_review,
     }
     operator = {
         "type": "StrictCoTFilter" if is_verifier else "CoTRewriter",
@@ -686,14 +743,29 @@ def execute_stage(
     for subpipeline, _name in pipeline.sub_pipelines:
         for op in subpipeline.operators:
             op.bind_context(context)
-    for batch in iter_microbatches(records, config["limits"]):
+    for batch in iter_microbatches(
+        records, config["limits"], with_image=role != "text_verify"
+    ):
         started = time.monotonic()
-        datas = load_images(batch, config["limits"]["max_decoded_pixels_per_batch"])
+        datas = (
+            [
+                {
+                    "conversations": [
+                        {"from": "human", "value": s.question},
+                        {"from": "gpt", "value": s.reference},
+                    ],
+                    "_cot": {"question_id": s.question_id},
+                }
+                for s in batch
+            ]
+            if role == "text_verify"
+            else load_images(batch, config["limits"]["max_decoded_pixels_per_batch"])
+        )
         budget.timings["decode_s"] += time.monotonic() - started
         try:
             for data in datas:
                 qid = data["_cot"]["question_id"]
-                if role == "joint_verify":
+                if candidate_review:
                     data["conversations"][1]["value"] = candidates[qid]["text"]
                     data["ori_answer"] = {"0": context.sources[qid].reference}
             started = time.monotonic()
@@ -744,7 +816,9 @@ def _stage_outputs(outcomes, store, part, role):
             "task_id": row["task_id"],
             "commit_sha256": commit_digest,
         }
-        if role in {"short", "long"} and row.get("text_hash"):
+        if (role in {"short", "long"} or role.startswith("generate_")) and row.get(
+            "text_hash"
+        ):
             receipt = recovery["receipts"].get(row["task_id"])
             require(receipt is not None, "candidate_missing_receipt", InvariantError)
             text = render_candidate(GenerationReceipt(**receipt), role)
@@ -791,6 +865,14 @@ def run(config, *, backend="http", limit=None):
         Path(input_path).resolve() if input_path else prepare(config, limit=limit)
     )
     manifest = verify_prepared(input_path)
+    if is_v2(config):
+        from .policy import source_policy
+
+        require(
+            manifest["recipe"].get("v2_defaults") == source_policy({}, config)
+            and [d["spec"] for d in manifest["recipe"]["sources"]] == config["sources"],
+            "prepared_source_policy_changed_reprepare_required",
+        )
     config["input_manifest"] = str(input_path)
     job_id = identity(manifest["input_digest"], config, version, backend)
     run_root = root / "runs" / job_id
@@ -816,6 +898,7 @@ def run(config, *, backend="http", limit=None):
         }
         handles = {}
         counts = Counter()
+        effort_outcomes, reasons, source_outcomes = Counter(), Counter(), Counter()
         selection_parts = []
         for index, prepared_part in enumerate(manifest["parts"]):
             input_part = f"input-{index:06d}"
@@ -832,187 +915,216 @@ def run(config, *, backend="http", limit=None):
                 "prepared_record_coverage",
                 InvariantError,
             )
-            reference_ready = {
-                r.question_id: (
-                    validate_bypass(r)
-                    if r.policy["task_type"] in {"pure_ocr", "box_grounding"}
-                    else verify_final("Answer: " + r.reference, r)
-                )["status"]
-                == "pass"
-                for r in records
-                if r.input_outcome == "pass"
-            }
-            eligible = [
-                r
-                for r in records
-                if r.input_outcome == "pass"
-                and r.policy["reference_grade"] == "strong"
-                and reference_ready[r.question_id]
-            ]
-            question = execute_stage(
-                eligible,
-                "question_check",
-                config,
-                backend,
-                store,
-                budget,
-                input_part,
-                handles,
-            )
-            cot_records = [
-                r
-                for r in eligible
-                if question[r.question_id]["status"] == "pass"
-                and r.policy["task_type"] not in {"pure_ocr", "box_grounding"}
-            ]
-            short = execute_stage(
-                cot_records,
-                "short",
-                config,
-                backend,
-                store,
-                budget,
-                input_part,
-                handles,
-                parents=parent_refs(question),
-            )
-            short_pass = [
-                r for r in cot_records if short[r.question_id]["status"] == "pass"
-            ]
-            short_verify = execute_stage(
-                short_pass,
-                "short_verify",
-                config,
-                backend,
-                store,
-                budget,
-                input_part,
-                handles,
-                candidates=short,
-                parents=parent_refs(short),
-            )
-            apply_reviews(short_verify, short, resolutions)
+            if is_v2(config):
+                from .runner_v2 import process_part
 
-            def short_status(record):
-                qid = record.question_id
-                return (
-                    short_verify[qid]["status"]
-                    if qid in short_verify
-                    else short[qid]["status"]
+                selections = process_part(
+                    records,
+                    prepared_part,
+                    config,
+                    backend,
+                    store,
+                    budget,
+                    input_part,
+                    handles,
                 )
+            else:
+                reference_ready = {
+                    r.question_id: (
+                        validate_bypass(r)
+                        if r.policy["task_type"] in {"pure_ocr", "box_grounding"}
+                        else verify_final("Answer: " + r.reference, r)
+                    )["status"]
+                    == "pass"
+                    for r in records
+                    if r.input_outcome == "pass"
+                }
+                eligible = [
+                    r
+                    for r in records
+                    if r.input_outcome == "pass"
+                    and r.policy["reference_grade"] == "strong"
+                    and reference_ready[r.question_id]
+                ]
+                question = execute_stage(
+                    eligible,
+                    "question_check",
+                    config,
+                    backend,
+                    store,
+                    budget,
+                    input_part,
+                    handles,
+                )
+                cot_records = [
+                    r
+                    for r in eligible
+                    if question[r.question_id]["status"] == "pass"
+                    and r.policy["task_type"] not in {"pure_ocr", "box_grounding"}
+                ]
+                short = execute_stage(
+                    cot_records,
+                    "short",
+                    config,
+                    backend,
+                    store,
+                    budget,
+                    input_part,
+                    handles,
+                    parents=parent_refs(question),
+                )
+                short_pass = [
+                    r for r in cot_records if short[r.question_id]["status"] == "pass"
+                ]
+                short_verify = execute_stage(
+                    short_pass,
+                    "short_verify",
+                    config,
+                    backend,
+                    store,
+                    budget,
+                    input_part,
+                    handles,
+                    candidates=short,
+                    parents=parent_refs(short),
+                )
+                apply_reviews(short_verify, short, resolutions)
 
-            long_records = [
-                r
-                for r in cot_records
-                if decide_route(
-                    short=short_status(r),
-                    complex_source=r.source
-                    in config.get("policy", {}).get("long_source_allowlist", []),
+                def short_status(record):
+                    qid = record.question_id
+                    return (
+                        short_verify[qid]["status"]
+                        if qid in short_verify
+                        else short[qid]["status"]
+                    )
+
+                long_records = [
+                    r
+                    for r in cot_records
+                    if decide_route(
+                        short=short_status(r),
+                        complex_source=r.source
+                        in config.get("policy", {}).get("long_source_allowlist", []),
+                    )
+                    == "dispatch_long"
+                ]
+                long = execute_stage(
+                    long_records,
+                    "long",
+                    config,
+                    backend,
+                    store,
+                    budget,
+                    input_part,
+                    handles,
+                    parents=parent_refs(question, short, short_verify),
                 )
-                == "dispatch_long"
-            ]
-            long = execute_stage(
-                long_records,
-                "long",
-                config,
-                backend,
-                store,
-                budget,
-                input_part,
-                handles,
-                parents=parent_refs(question, short, short_verify),
-            )
-            long_pass = [
-                r for r in long_records if long[r.question_id]["status"] == "pass"
-            ]
-            long_verify = execute_stage(
-                long_pass,
-                "long_verify",
-                config,
-                backend,
-                store,
-                budget,
-                input_part,
-                handles,
-                candidates=long,
-                parents=parent_refs(long),
-            )
-            apply_reviews(long_verify, long, resolutions)
-            selections = []
-            for source in records:
-                qid = source.question_id
-                if source.input_outcome != "pass":
-                    terminal = "input_rejected"
-                elif (
-                    source.policy["reference_grade"] != "strong"
-                    or not reference_ready[qid]
-                ):
-                    terminal = "needs_review"
-                else:
-                    long_status = long_verify.get(qid, long.get(qid, {})).get(
-                        "status", "absent"
-                    )
-                    terminal = decide_route(
-                        question_check=question[qid]["status"],
-                        bypass=source.policy["task_type"]
-                        in {"pure_ocr", "box_grounding"},
-                        short=short_status(source) if qid in short else "absent",
-                        long=long_status,
-                    )
-                    if (
-                        terminal == "bypass_verified"
-                        and validate_bypass(source)["status"] != "pass"
+                long_pass = [
+                    r for r in long_records if long[r.question_id]["status"] == "pass"
+                ]
+                long_verify = execute_stage(
+                    long_pass,
+                    "long_verify",
+                    config,
+                    backend,
+                    store,
+                    budget,
+                    input_part,
+                    handles,
+                    candidates=long,
+                    parents=parent_refs(long),
+                )
+                apply_reviews(long_verify, long, resolutions)
+                selections = []
+                for source in records:
+                    qid = source.question_id
+                    if source.input_outcome != "pass":
+                        terminal = "input_rejected"
+                    elif (
+                        source.policy["reference_grade"] != "strong"
+                        or not reference_ready[qid]
                     ):
                         terminal = "needs_review"
-                require(
-                    terminal
-                    in {
-                        "accepted_cot",
-                        "bypass_verified",
-                        "input_rejected",
-                        "candidate_rejected",
-                        "needs_review",
-                        "technical_pending",
-                    },
-                    "nonterminal_selection",
-                    InvariantError,
-                )
-                chosen = None
-                if terminal == "accepted_cot":
-                    chosen = short[qid] if short_status(source) == "pass" else long[qid]
-                selection = {
-                    "question_id": qid,
-                    "terminal": terminal,
-                    "source_row": source.row,
-                    "source_part": prepared_part["file"],
-                    "input_reason": source.input_reason,
-                }
-                if chosen:
-                    selection.update(
-                        {
-                            key: chosen[key]
-                            for key in (
-                                "candidate_id",
-                                "text_hash",
-                                "receipt_ref",
-                                "recipe_signature",
-                            )
-                        }
+                    else:
+                        long_status = long_verify.get(qid, long.get(qid, {})).get(
+                            "status", "absent"
+                        )
+                        terminal = decide_route(
+                            question_check=question[qid]["status"],
+                            bypass=source.policy["task_type"]
+                            in {"pure_ocr", "box_grounding"},
+                            short=short_status(source) if qid in short else "absent",
+                            long=long_status,
+                        )
+                        if (
+                            terminal == "bypass_verified"
+                            and validate_bypass(source)["status"] != "pass"
+                        ):
+                            terminal = "needs_review"
+                    require(
+                        terminal
+                        in {
+                            "accepted_cot",
+                            "bypass_verified",
+                            "input_rejected",
+                            "candidate_rejected",
+                            "needs_review",
+                            "technical_pending",
+                        },
+                        "nonterminal_selection",
+                        InvariantError,
                     )
-                    selection["stage"] = "short" if chosen is short.get(qid) else "long"
-                    verification = (
-                        short_verify[qid]
-                        if selection["stage"] == "short"
-                        else long_verify[qid]
-                    )
-                    selection["verification_ref"] = verification["receipt_ref"]
-                    selection["judge_signature"] = verification["recipe_signature"]
-                    if verification.get("review_resolution"):
-                        selection["review_resolution"] = verification[
-                            "review_resolution"
-                        ]
-                selections.append(selection)
-                counts[terminal] += 1
+                    chosen = None
+                    if terminal == "accepted_cot":
+                        chosen = (
+                            short[qid] if short_status(source) == "pass" else long[qid]
+                        )
+                    selection = {
+                        "question_id": qid,
+                        "terminal": terminal,
+                        "source_row": source.row,
+                        "source_part": prepared_part["file"],
+                        "input_reason": source.input_reason,
+                    }
+                    if chosen:
+                        selection.update(
+                            {
+                                key: chosen[key]
+                                for key in (
+                                    "candidate_id",
+                                    "text_hash",
+                                    "receipt_ref",
+                                    "recipe_signature",
+                                )
+                            }
+                        )
+                        selection["stage"] = (
+                            "short" if chosen is short.get(qid) else "long"
+                        )
+                        verification = (
+                            short_verify[qid]
+                            if selection["stage"] == "short"
+                            else long_verify[qid]
+                        )
+                        selection["verification_ref"] = verification["receipt_ref"]
+                        selection["judge_signature"] = verification["recipe_signature"]
+                        if verification.get("review_resolution"):
+                            selection["review_resolution"] = verification[
+                                "review_resolution"
+                            ]
+                    selections.append(selection)
+            counts.update(s["terminal"] for s in selections)
+            if is_v2(config):
+                names = {r.question_id: r.source for r in records}
+                for selected in selections:
+                    reasons[selected["reason"]] += 1
+                    source_outcomes[
+                        names[selected["question_id"]] + ":" + selected["terminal"]
+                    ] += 1
+                    for attempt in selected["attempts"]:
+                        effort_outcomes[
+                            attempt["effort"] + ":" + attempt["status"]
+                        ] += 1
             selection_path = store.root / "selection" / f"{input_part}.jsonl"
             atomic_bytes(
                 selection_path, b"".join(canonical(row) + b"\n" for row in selections)
@@ -1050,6 +1162,13 @@ def run(config, *, backend="http", limit=None):
             "throughput_verified": False,
             "student_training_verified": False,
         }
+        if is_v2(config):
+            report.update(
+                effort_outcomes=dict(effort_outcomes),
+                terminal_reasons=dict(reasons),
+                source_outcomes=dict(source_outcomes),
+                review_mode=config["policy"]["review_mode"],
+            )
         atomic_json(store.root / "report.json", report)
         observation = {
             "schema_version": "image_cot.execution_observation/1",

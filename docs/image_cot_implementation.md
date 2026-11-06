@@ -1,5 +1,8 @@
 # DataStudio 图片 CoT：实现、使用与验收边界
 
+**v2 更新：** 新的评级封顶产线、Honey adapter 与逐请求落盘见 [v2 实现与操作说明](image_cot_v2_operations.md)。
+本文以下保留 v1 的实现历史和双档行为，不能用它推断 v2 的路由。
+
 实际操作请先读 **[详细操作手册](image_cot_operations_manual.md)**；
 本页保留架构、实现取舍及验收边界，[项目首页](../README.md)提供入口导航。
 

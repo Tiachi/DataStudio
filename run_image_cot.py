@@ -20,11 +20,11 @@ from datastudio.image_cot.storage import read_json
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("check", "prepare", "run"):
+    for name in ("check", "profile", "prepare", "run"):
         command = sub.add_parser(name)
         command.add_argument("-c", "--config", required=True)
         command.add_argument("--backend", choices=("http", "mock"), default="http")
-        if name != "check":
+        if name in {"prepare", "run"}:
             command.add_argument("--limit", type=int)
     for name in ("resume", "report", "export"):
         command = sub.add_parser(name)
@@ -49,7 +49,11 @@ def main(argv=None):
                 "PASS: configuration preflight only; no endpoint call or quality test"
             )
             return 0
-        if args.command == "prepare":
+        if args.command == "profile":
+            from datastudio.image_cot.profile import profile_sources
+
+            result = profile_sources(load_config(args.config))
+        elif args.command == "prepare":
             result = prepare(load_config(args.config), limit=args.limit)
         elif args.command == "run":
             result = run(

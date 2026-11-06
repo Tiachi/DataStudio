@@ -2,6 +2,7 @@
 datastudio/image_cot/*.py text eol=lf
 configs/image_cot/*.py text eol=lf
 prompts/image_cot/*.txt text eol=lf
+prompts/image_cot/v2/*.txt text eol=lf
 tests/image_cot/*.py text eol=lf
 run_image_cot.py text eol=lf
 requirements-image-cot-dev.txt text eol=lf

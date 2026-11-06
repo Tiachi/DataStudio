@@ -126,7 +126,7 @@ def normalize_connection(connection):
     result = dict(connection)
     profile = result.get("provider_profile", "openai_compatible")
     require(
-        profile in {"openai_compatible", "deepseek_official"},
+        profile in {"openai_compatible", "deepseek_official", "kimi_official"},
         "unknown_provider_profile",
     )
     endpoint = result.get("endpoint")
@@ -198,6 +198,14 @@ def normalize_connection(connection):
             "deepseek_official_host_required",
         )
         require(auth["mode"] == "env_bearer", "deepseek_auth_required")
+    if profile == "kimi_official":
+        require(
+            parsed.scheme == "https"
+            and parsed.hostname in {"api.moonshot.ai", "api.moonshot.cn"}
+            and parsed.port in (None, 443),
+            "kimi_official_host_required",
+        )
+        require(auth["mode"] == "env_bearer", "kimi_auth_required")
     return result
 
 
@@ -212,7 +220,11 @@ def load_config(path):
 def validate_config(config, *, runtime=False, backend="http"):
     """Pure validation/resolution; missing real budgets fail before any dispatch."""
     config = strict_json(canonical(config))
-    require(config.get("schema_version") == SCHEMA, "config_schema")
+    from .policy import V2_SCHEMA, validate_policy
+
+    version_two = config.get("schema_version") == V2_SCHEMA
+    require(config.get("schema_version") in {SCHEMA, V2_SCHEMA}, "config_schema")
+    expected_roles = validate_policy(config) if version_two else set(ROLES)
     require(config.get("mode") in {"pilot", "production", "mock"}, "invalid_mode")
     require(backend in {"http", "mock"}, "invalid_backend")
     require(
@@ -276,7 +288,7 @@ def validate_config(config, *, runtime=False, backend="http"):
     }
     config["connections"] = connections
     models = config.get("models", {})
-    require(set(models) == set(ROLES), "all_four_model_roles_required")
+    require(set(models) == expected_roles, "all_four_model_roles_required")
     for role, model in models.items():
         require(
             type(model.get("request_revision", "1")) is str
@@ -301,6 +313,17 @@ def validate_config(config, *, runtime=False, backend="http"):
         require(set(options).issubset(allowed), "unsupported_request_option")
         if (
             ref in connections
+            and connections[ref]["provider_profile"] == "kimi_official"
+        ):
+            require(
+                options.get("reasoning_effort", "max") in {"low", "high", "max"},
+                "kimi_unsupported_effort",
+            )
+            require(
+                options.get("thinking") != {"type": "disabled"}, "kimi_always_thinking"
+            )
+        if (
+            ref in connections
             and connections[ref]["provider_profile"] == "deepseek_official"
         ):
             require(
@@ -323,7 +346,14 @@ def validate_config(config, *, runtime=False, backend="http"):
             for name in ("max_output_tokens", "read_timeout_s", "batch_deadline_s"):
                 positive_int(model.get(name), f"{role}.{name}")
             require(
-                type(model.get("prompt")) is str and Path(model["prompt"]).is_file(),
+                (
+                    version_two
+                    and role.startswith("generate_")
+                    and model.get("prompt") is None
+                )
+                or (
+                    type(model.get("prompt")) is str and Path(model["prompt"]).is_file()
+                ),
                 f"missing_prompt:{role}",
             )
             if backend == "http":
@@ -593,6 +623,7 @@ class RuntimeContext:
     dispatch: Any
     candidate_ids: dict[str, str] = field(default_factory=dict)
     outcomes: dict[str, dict] = field(default_factory=dict)
+    settings: dict = field(default_factory=dict)
 
     def record_outcome(self, question_id, outcome):
         require(
